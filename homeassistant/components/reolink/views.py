@@ -1,8 +1,10 @@
 """Reolink Integration views."""
 
+import asyncio
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from http import HTTPStatus
 import logging
+import re
 
 from aiohttp import ClientError, ClientTimeout, web
 from reolink_aio.enums import VodRequestType
@@ -71,8 +73,25 @@ class PlaybackProxyView(HomeAssistantView):
 
         filename_decoded = urlsafe_b64decode(filename.encode("utf-8")).decode("utf-8")
         ch = int(channel)
-        if self._vod_type is not None:
-            vod_type = self._vod_type
+
+        # Parse the clip duration from the recording file name (Rec<ai>_DST
+        # <date>_<start HHMMSS>_<end HHMMSS>_...) so ffmpeg can stop exactly at
+        # the end instead of waiting for the stream to stall, and so the remuxed
+        # MP4 has a correct total duration (seekable progress bar).
+        clip_seconds: int | None = None
+        _dur_m = re.search(
+            r"Rec\w{3}(?:_DST|_)\d{8}_(\d{2})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_",
+            filename_decoded,
+        )
+        if _dur_m:
+            g = [int(x) for x in _dur_m.groups()]
+            start_s = g[0] * 3600 + g[1] * 60 + g[2]
+            end_s = g[3] * 3600 + g[4] * 60 + g[5]
+            diff = end_s - start_s
+            if diff < 0:
+                diff += 86400
+            if 0 < diff <= 1800:
+                clip_seconds = diff
         try:
             host = get_host(self.hass, config_entry_id)
         except Unresolvable:
@@ -91,9 +110,33 @@ class PlaybackProxyView(HomeAssistantView):
             _LOGGER.warning("Reolink playback proxy error: %s", str(err))
             return web.Response(body=str(err), status=HTTPStatus.BAD_REQUEST)
 
+        # For the streaming Playback command use the "native" form the Reolink
+        # web UI uses: cmd=Playback with channel/type/seek and WITHOUT the
+        # output= parameter. cmd=Download (and cmd=Playback with output=) make
+        # the camera prepare a temporary file on the SD card, which is
+        # unreliable when the card is (nearly) full and can lock up the camera's
+        # single VOD session. The plain streaming Playback request does not
+        # create a temp file and is reliable. It returns video/x-flv, which is
+        # remuxed to fragmented MP4 below so the browser can play it.
+        if "cmd=Playback" in reolink_url:
+            reolink_url = re.sub(r"&output=[^&]*", "", reolink_url)
+            stream_type = (
+                1 if stream_res in ("sub", "autotrack_sub", "telephoto_sub") else 0
+            )
+            if "&channel=" not in reolink_url:
+                reolink_url = reolink_url.replace(
+                    "cmd=Playback", f"cmd=Playback&channel={ch}", 1
+                )
+            if "&type=" not in reolink_url:
+                reolink_url = f"{reolink_url}&type={stream_type}"
+            if "&seek=" not in reolink_url:
+                reolink_url = f"{reolink_url}&seek=0"
+
         headers = dict(request.headers)
         headers.pop("Host", None)
         headers.pop("Referer", None)
+        # streaming Playback does not support Range; drop it and answer 200
+        headers.pop("Range", None)
 
         if _LOGGER.isEnabledFor(logging.DEBUG):
             _LOGGER.debug(
@@ -117,7 +160,7 @@ class PlaybackProxyView(HomeAssistantView):
             )
         except ClientError as err:
             err_str = host.api.hide_password(
-                f"Reolink playback error while getting mp4: {err!s}"
+                f"Reolink playback error while getting video: {err!s}"
             )
             if retry <= 0:
                 _LOGGER.warning(err_str)
@@ -128,39 +171,30 @@ class PlaybackProxyView(HomeAssistantView):
                 request, config_entry_id, channel, stream_res, vod_type, filename, retry
             )
 
-        # Reolink typo "apolication/octet-stream" instead of "application/octet-stream"
-        if reolink_response.content_type not in [
+        content_type = reolink_response.content_type
+
+        # Cameras such as the Lumus/Duo return video/x-flv from Playback. The
+        # browser <video> element cannot play an FLV container, so remux (stream
+        # copy, no re-encode) to fragmented MP4 with ffmpeg and stream that.
+        if content_type == "video/x-flv":
+            return await self._stream_flv_as_mp4(
+                request, reolink_response, clip_seconds
+            )
+
+        # Other cameras (e.g. E1 series) return a directly playable mp4.
+        if content_type not in (
             "video/mp4",
             "application/octet-stream",
             "apolication/octet-stream",
-        ]:
+        ):
             err_str = (
-                "Reolink playback expected video/mp4"
-                f" but got {reolink_response.content_type}"
+                "Reolink playback expected video/mp4 or video/x-flv"
+                f" but got {content_type}"
             )
-            if (
-                reolink_response.content_type == "video/x-flv"
-                and vod_type == VodRequestType.PLAYBACK.value
-            ):
-                # next time use DOWNLOAD immediately
-                self._vod_type = VodRequestType.DOWNLOAD.value
-                _LOGGER.debug(
-                    "%s, retrying using download instead of playback cmd", err_str
-                )
-                return await self.get(
-                    request,
-                    config_entry_id,
-                    channel,
-                    stream_res,
-                    self._vod_type,
-                    filename,
-                    retry,
-                )
-
             _LOGGER.error(err_str)
-            if reolink_response.content_type == "text/html":
-                text = await reolink_response.text()
-                _LOGGER.debug(text)
+            if content_type == "text/html":
+                _LOGGER.debug(await reolink_response.text())
+            reolink_response.close()
             return web.Response(body=err_str, status=HTTPStatus.BAD_REQUEST)
 
         response_headers = dict(reolink_response.headers)
@@ -171,7 +205,7 @@ class PlaybackProxyView(HomeAssistantView):
             response_headers,
         )
         if "Content-Type" not in response_headers:
-            response_headers["Content-Type"] = reolink_response.content_type
+            response_headers["Content-Type"] = content_type
         if response_headers["Content-Type"] == "apolication/octet-stream":
             response_headers["Content-Type"] = "application/octet-stream"
 
@@ -180,9 +214,7 @@ class PlaybackProxyView(HomeAssistantView):
             reason=reolink_response.reason,
             headers=response_headers,
         )
-
         await response.prepare(request)
-
         try:
             async for chunk in reolink_response.content.iter_chunked(65536):
                 await response.write(chunk)
@@ -193,6 +225,95 @@ class PlaybackProxyView(HomeAssistantView):
             )
         finally:
             reolink_response.release()
+        await response.write_eof()
+        return response
+
+    async def _stream_flv_as_mp4(
+        self,
+        request: web.Request,
+        reolink_response,
+        clip_seconds: int | None = None,
+    ) -> web.StreamResponse:
+        """Remux an x-flv playback stream to fragmented MP4 and stream it.
+
+        The camera streams the recording at playback speed, so the data is
+        remuxed (stream copy, no re-encode) and forwarded to the browser as it
+        arrives; buffering the whole clip first is not viable. ``-t`` tells
+        ffmpeg the total length so it can stop at the recording end (instead of
+        waiting for the stream to stall) and advertise the duration.
+        """
+        args = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "flv",
+            "-i",
+            "pipe:0",
+        ]
+        if clip_seconds:
+            args += ["-t", str(clip_seconds)]
+        args += [
+            "-c",
+            "copy",
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof",
+            "-f",
+            "mp4",
+            "pipe:1",
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+        response = web.StreamResponse(
+            status=HTTPStatus.OK, headers={"Content-Type": "video/mp4"}
+        )
+        await response.prepare(request)
+
+        async def _feed() -> None:
+            try:
+                async for chunk in reolink_response.content.iter_chunked(65536):
+                    proc.stdin.write(chunk)
+                    await proc.stdin.drain()
+            except (TimeoutError, ClientError, ConnectionResetError, BrokenPipeError):
+                pass
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("Reolink remux feeder error", exc_info=True)
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        feeder = asyncio.ensure_future(_feed())
+        try:
+            while True:
+                data = await proc.stdout.read(65536)
+                if not data:
+                    break
+                await response.write(data)
+        except (ConnectionResetError, ClientError):
+            pass
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Reolink remux writer error", exc_info=True)
+        finally:
+            feeder.cancel()
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await proc.wait()
+            except Exception:  # noqa: BLE001
+                pass
+            reolink_response.close()
 
         await response.write_eof()
         return response
